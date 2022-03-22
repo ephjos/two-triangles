@@ -1,4 +1,7 @@
 
+// ----------------------------------------------------------------------------
+// Utils
+
 // https://webglfundamentals.org/webgl/lessons/webgl-resizing-the-canvas.html
 function resizeCanvasToDisplaySize(canvas) {
   // Lookup the size the browser is displaying the canvas in CSS pixels.
@@ -18,117 +21,45 @@ function resizeCanvasToDisplaySize(canvas) {
   return needResize;
 }
 
-// Initializes all listeners
-function attachListeners() {
-}
+// ----------------------------------------------------------------------------
+// Globals
 
-async function main() {
-  attachListeners();
-  const canvas = document.querySelector('#glcanvas');
-  const gl = canvas.getContext('webgl');
+let gl;
 
-  if (!gl) {
-    alert('Unable to initialize WebGL. Your browser or machine may not support it.');
-    return;
+// ----------------------------------------------------------------------------
+// Common wrapper for building a shader program with a vertex and fragment shader
+function ShaderWrapper(vertexSource, fragmentSource, attributeNames, uniformNames) {
+  this.shaderProgram = ShaderWrapper.createShaderProgram(vertexSource, fragmentSource);
+
+  this.attributes = {};
+  for (const attributeName of attributeNames) {
+    this.attributes[attributeName] = gl.getAttribLocation(this.shaderProgram, attributeName);
   }
 
-  const vsSource = `
-    attribute vec4 aVertexPosition;
+  this.uniforms = {};
+  for (const uniformName of uniformNames) {
+    this.uniforms[uniformName] = gl.getUniformLocation(this.shaderProgram, uniformName);
+  }
+}
+ShaderWrapper.createShaderProgram = function(vertexSource, fragmentSource) {
+  function loadShader(gl, type, source) {
+    const shader = gl.createShader(type);
 
-    void main(void) {
-      gl_Position = aVertexPosition;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      alert('An error occurred compiling the shaders: ' + gl.getShaderInfoLog(shader));
+      gl.deleteShader(shader);
+      return null;
     }
-  `;
 
-  // Moved fragment shader to a separate file loaded at runtime to make dev
-  // easier. This way is inefficient but removes the need for a bundling tool.
-  const fsSource = await fetch("./fragment.glsl").then(res => res.text());
-
-  const shaderProgram = initShaderProgram(gl, vsSource, fsSource);
-
-  const programInfo = {
-    program: shaderProgram,
-    attribLocations: {
-      vertexPosition: gl.getAttribLocation(shaderProgram, 'aVertexPosition'),
-    },
-    uniformLocations: {
-      resolution: gl.getUniformLocation(shaderProgram, 'uResolution'),
-      time: gl.getUniformLocation(shaderProgram, 'uTime'),
-    },
-  };
-
-  const buffers = setBuffers(gl);
-
-  draw(gl, programInfo, buffers, 0);
-}
-
-// Draw two triangles to cover the screen
-function setBuffers(gl) {
-  const positionBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-  let positions = [
-    -1.0, -1.0,
-    1.0,   1.0,
-    -1.0,  1.0,
-    -1.0,  -1.0,
-    1.0,   1.0,
-    1.0,  -1.0,
-  ];
-
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
-
-  return {
-    position: positionBuffer,
-  };
-}
-
-function draw(gl, programInfo, buffers, now) {
-  if (resizeCanvasToDisplaySize(gl.canvas)) {
-    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    return shader;
   }
 
-  gl.clearColor(1.0, 1.0, 1.0, 1.0);
-  gl.clearDepth(1.0);
-  gl.enable(gl.DEPTH_TEST);
-  gl.depthFunc(gl.LEQUAL);
-
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-  // Attributes
-  {
-    const numComponents = 2;
-    const type = gl.FLOAT;
-    const normalize = false;
-    const stride = 0;
-    const offset = 0;
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
-    gl.vertexAttribPointer(
-      programInfo.attribLocations.vertexPosition,
-      numComponents,
-      type,
-      normalize,
-      stride,
-      offset);
-    gl.enableVertexAttribArray(
-      programInfo.attribLocations.vertexPosition);
-  }
-
-  gl.useProgram(programInfo.program);
-
-  // Uniforms
-  {
-    gl.uniform2fv(programInfo.uniformLocations.resolution, [gl.canvas.width, gl.canvas.height]);
-    gl.uniform1f(programInfo.uniformLocations.time, now / 1000);
-  }
-
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-  window.requestAnimationFrame((now) => draw(gl, programInfo, buffers, now));
-}
-
-function initShaderProgram(gl, vsSource, fsSource) {
-  const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vsSource);
-  const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
+  // Create shaders, combine into program
+  const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vertexSource);
+  const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
 
   const shaderProgram = gl.createProgram();
   gl.attachShader(shaderProgram, vertexShader);
@@ -141,22 +72,114 @@ function initShaderProgram(gl, vsSource, fsSource) {
   }
 
   return shaderProgram;
+};
+
+// ----------------------------------------------------------------------------
+// Program objects that implement a full program.
+//   constructor: create shader wrapper and any initial data
+//   update: called once every render loop before the render function
+//   render: called once every render loop to produce output
+//   create: optional, async constructor hook
+
+function CoreProgram(shaderWrapper) {
+  this.shaderWrapper = shaderWrapper;
+
+  this.positionBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+  const positions = [
+    -1.0, -1.0,
+    -1.0,   1.0,
+    1.0,   1.0,
+    1.0,   -1.0,
+  ];
+
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
 }
 
-function loadShader(gl, type, source) {
-  const shader = gl.createShader(type);
+CoreProgram.create = async function() {
+  const vsSource = `
+    attribute vec4 aVertexPosition;
 
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
+    void main(void) {
+      gl_Position = aVertexPosition;
+    }
+  `;
 
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    alert('An error occurred compiling the shaders: ' + gl.getShaderInfoLog(shader));
-    gl.deleteShader(shader);
-    return null;
+  // Moved fragment shader to a separate file loaded at runtime to make dev
+  // easier. This way is inefficient but removes the need for a bundling tool.
+  const fsSource = await fetch("./fragment.glsl").then(res => res.text());
+
+  const shaderProgram = new ShaderWrapper(vsSource, fsSource, ["aVertexPosition"], ["uResolution", "uTime"]);
+  return new CoreProgram(shaderProgram);
+}
+
+CoreProgram.prototype.update = function() {}
+CoreProgram.prototype.render = function(context) {
+  gl.useProgram(this.shaderWrapper.shaderProgram);
+
+  // Set vertex attribute
+  const numComponents = 2;
+  const type = gl.FLOAT;
+  const normalize = false;
+  const stride = 0;
+  const offset = 0;
+  gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+  gl.vertexAttribPointer(
+    this.shaderWrapper.attributes.aVertexPosition,
+    numComponents,
+    type,
+    normalize,
+    stride,
+    offset);
+  gl.enableVertexAttribArray(
+    this.shaderWrapper.attributes.aVertexPosition);
+
+  // Set uniforms
+  gl.uniform2fv(this.shaderWrapper.uniforms.uResolution, [gl.canvas.width, gl.canvas.height]);
+  gl.uniform1f(this.shaderWrapper.uniforms.uTime, context.now / 1000);
+
+  gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+  gl.flush();
+}
+
+// ----------------------------------------------------------------------------
+
+// Main draw function
+function draw(gl, programs, context) {
+  if (resizeCanvasToDisplaySize(gl.canvas)) {
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
   }
 
-  return shader;
+  const coreProgram = programs.coreProgram;
+  coreProgram.update();
+  coreProgram.render(context);
+
+  window.requestAnimationFrame((now) => {
+    context.now = now;
+    draw(gl, programs, context);
+  });
 }
 
-main();
+// Entrypoint
+async function main() {
+  const canvas = document.querySelector('#glcanvas');
+  gl = canvas.getContext('webgl');
+
+  if (!gl) {
+    alert('Unable to initialize WebGL. Your browser or machine may not support it.');
+    return;
+  }
+
+  const coreProgram = await CoreProgram.create();
+  const programs = {
+    coreProgram,
+  };
+  const context = {
+    now: 0,
+  };
+
+  draw(gl, programs, context);
+}
+
+window.onload = main;
 
