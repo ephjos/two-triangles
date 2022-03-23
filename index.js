@@ -2,25 +2,6 @@
 // ----------------------------------------------------------------------------
 // Utils
 
-// https://webglfundamentals.org/webgl/lessons/webgl-resizing-the-canvas.html
-function resizeCanvasToDisplaySize(canvas) {
-  // Lookup the size the browser is displaying the canvas in CSS pixels.
-  const displayWidth  = canvas.clientWidth;
-  const displayHeight = canvas.clientHeight;
-
-  // Check if the canvas is not the same size.
-  const needResize = canvas.width  !== displayWidth ||
-    canvas.height !== displayHeight;
-
-  if (needResize) {
-    // Make the canvas the same size
-    canvas.width  = displayWidth;
-    canvas.height = displayHeight;
-  }
-
-  return needResize;
-}
-
 // ----------------------------------------------------------------------------
 // Globals
 
@@ -81,8 +62,9 @@ ShaderWrapper.createShaderProgram = function(vertexSource, fragmentSource) {
 //   render: called once every render loop to produce output
 //   create: optional, async constructor hook
 
-function CoreProgram(shaderWrapper) {
-  this.shaderWrapper = shaderWrapper;
+function CoreProgram(renderWrapper, displayWrapper) {
+  this.renderWrapper = renderWrapper;
+  this.displayWrapper = displayWrapper;
 
   this.positionBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
@@ -94,10 +76,23 @@ function CoreProgram(shaderWrapper) {
   ];
 
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+  this.framebuffer = gl.createFramebuffer();
+
+  const type = gl.getExtension('OES_texture_float') ? gl.FLOAT : gl.UNSIGNED_BYTE;
+  this.textures = [];
+  for(let i = 0; i < 2; i++) {
+    this.textures.push(gl.createTexture());
+    gl.bindTexture(gl.TEXTURE_2D, this.textures[i]);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.canvas.width, gl.canvas.height, 0, gl.RGB, type, null);
+  }
+  gl.bindTexture(gl.TEXTURE_2D, null);
 }
 
 CoreProgram.create = async function() {
-  const vsSource = `
+  const vertexSource = `
     attribute vec4 aVertexPosition;
 
     void main(void) {
@@ -107,37 +102,65 @@ CoreProgram.create = async function() {
 
   // Moved fragment shader to a separate file loaded at runtime to make dev
   // easier. This way is inefficient but removes the need for a bundling tool.
-  const fsSource = await fetch("./fragment.glsl").then(res => res.text());
+  const renderFragmentSource = await fetch("./fragment.glsl").then(res => res.text());
+  const renderProgram = new ShaderWrapper(vertexSource, renderFragmentSource, ["aVertexPosition"], ["uResolution", "uTime", "uTexture"]);
 
-  const shaderProgram = new ShaderWrapper(vsSource, fsSource, ["aVertexPosition"], ["uResolution", "uTime"]);
-  return new CoreProgram(shaderProgram);
+  const displayFragmentSource = `
+    precision highp float;
+    uniform sampler2D uTexture;
+    uniform vec2 uResolution;
+    void main() {
+      gl_FragColor = texture2D(uTexture, gl_FragCoord.xy / uResolution);
+    }
+  `;
+  const displayProgram = new ShaderWrapper(vertexSource, displayFragmentSource, ["aVertexPosition"], ["uResolution", "uTexture"]);
+  return new CoreProgram(renderProgram, displayProgram);
 }
 
-CoreProgram.prototype.update = function() {}
-CoreProgram.prototype.render = function(context) {
-  gl.useProgram(this.shaderWrapper.shaderProgram);
+CoreProgram.prototype.update = function(context) {
+  const wrapper = this.renderWrapper;
+  const attributes = wrapper.attributes;
+  const uniforms = wrapper.uniforms;
 
-  // Set vertex attribute
-  const numComponents = 2;
-  const type = gl.FLOAT;
-  const normalize = false;
-  const stride = 0;
-  const offset = 0;
+  // render to texture
+  gl.useProgram(wrapper.shaderProgram);
+  gl.bindTexture(gl.TEXTURE_2D, this.textures[0]);
   gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.textures[1], 0);
+
   gl.vertexAttribPointer(
-    this.shaderWrapper.attributes.aVertexPosition,
-    numComponents,
-    type,
-    normalize,
-    stride,
-    offset);
+    attributes.aVertexPosition,
+    2,
+    gl.FLOAT,
+    false,
+    0,
+    0);
   gl.enableVertexAttribArray(
-    this.shaderWrapper.attributes.aVertexPosition);
+    attributes.aVertexPosition);
 
-  // Set uniforms
-  gl.uniform2fv(this.shaderWrapper.uniforms.uResolution, [gl.canvas.width, gl.canvas.height]);
-  gl.uniform1f(this.shaderWrapper.uniforms.uTime, context.now / 1000);
+  gl.uniform2fv(uniforms.uResolution, [gl.canvas.width, gl.canvas.height]);
+  gl.uniform1f(uniforms.uTime, context.now / 1000);
 
+  gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+  gl.flush();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // ping pong textures
+  this.textures.reverse();
+}
+CoreProgram.prototype.render = function(context) {
+  const wrapper = this.displayWrapper;
+  const attributes = wrapper.attributes;
+  const uniforms = wrapper.uniforms;
+
+  gl.useProgram(wrapper.shaderProgram);
+  gl.bindTexture(gl.TEXTURE_2D, this.textures[0]);
+  gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+  gl.vertexAttribPointer(attributes.aVertexPosition, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(
+    attributes.aVertexPosition);
+  gl.uniform2fv(uniforms.uResolution, [gl.canvas.width, gl.canvas.height]);
   gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
   gl.flush();
 }
@@ -146,12 +169,8 @@ CoreProgram.prototype.render = function(context) {
 
 // Main draw function
 function draw(gl, programs, context) {
-  if (resizeCanvasToDisplaySize(gl.canvas)) {
-    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-  }
-
   const coreProgram = programs.coreProgram;
-  coreProgram.update();
+  coreProgram.update(context);
   coreProgram.render(context);
 
   window.requestAnimationFrame((now) => {
